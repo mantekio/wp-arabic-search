@@ -1,0 +1,22 @@
+{
+    "name": "mantekio/wp-arabic-search",
+    "description": "Makes WordPress search match Arabic: folds diacritics, tatweel, alef and hamza forms on both the stored text and the query, and searches an indexed shadow copy instead of an unindexed LIKE scan.",
+    "type": "wordpress-muplugin",
+    "license": "GPL-2.0-or-later",
+    "keywords": ["wordpress", "arabic", "search", "normalization", "wp-cli", "fulltext", "mu-plugin"],
+    "homepage": "https://github.com/mantekio/wp-arabic-search",
+    "authors": [
+        {
+            "name": "Jaafar Abazid",
+            "email": "jaafar@mantek.io",
+            "homepage": "https://www.mantek.io"
+        }
+    ],
+    "require": {
+        "php": ">=7.4"
+    },
+    "support": {
+        "issues": "https://github.com/mantekio/wp-arabic-search/issues",
+        "source": "https://github.com/mantekio/wp-arabic-search"
+    }
+}

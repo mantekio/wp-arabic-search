@@ -208,11 +208,36 @@ function unindex_post( $post_id ): void {
 }
 
 /**
+ * The server's FULLTEXT minimum token length.
+ *
+ * InnoDB does not index tokens shorter than innodb_ft_min_token_size (3 by
+ * default), so a REQUIRED `+token` below that length can never match anything.
+ * We have to know the threshold to avoid asking an impossible question.
+ * Cached per request; falls back to the documented default.
+ */
+function min_token_size(): int {
+	static $min = null;
+	if ( null !== $min ) {
+		return $min;
+	}
+	global $wpdb;
+	$val = $wpdb->get_var( 'SELECT @@innodb_ft_min_token_size' );
+	$min = ( null === $val || '' === $val ) ? 3 : max( 1, (int) $val );
+	return $min;
+}
+
+/**
  * Replace WordPress's LIKE search with a lookup against the normalised index.
  *
  * The query is put through the identical normaliser, then matched with
  * FULLTEXT in boolean mode with every token required, which mirrors the AND
  * behaviour of core's search rather than loosening it.
+ *
+ * Tokens too short for the index are dropped, and if that leaves nothing we
+ * hand the query back to core untouched. The rule is that this plugin must
+ * never answer worse than the search it replaces: a two-letter Arabic word
+ * like من or في is below InnoDB's default threshold, so requiring it would
+ * turn a search core answers perfectly well into an empty page.
  */
 function rewrite_search( $search, $query ) {
 	if ( 'index' !== mode() || ! $query->is_search() ) {
@@ -223,35 +248,52 @@ function rewrite_search( $search, $query ) {
 		return $search;
 	}
 
+	$min    = min_token_size();
 	$tokens = preg_split( '/\s+/u', $term, -1, PREG_SPLIT_NO_EMPTY );
 	$tokens = array_filter( array_map(
 		static function ( $t ) {
 			// Strip boolean-mode operators so a stray character cannot break the query.
-			return '+' . preg_replace( '/[+\-><()~*"@]+/u', '', $t );
+			return preg_replace( '/[+\-><()~*"@]+/u', '', $t );
 		},
 		$tokens
-	), static function ( $t ) {
-		return strlen( $t ) > 1;
+	), static function ( $t ) use ( $min ) {
+		// mb_strlen, not strlen: an Arabic character is two bytes, so a byte
+		// count waves through exactly the short tokens FULLTEXT refuses to index.
+		return mb_strlen( $t, 'UTF-8' ) >= $min;
 	} );
 	if ( ! $tokens ) {
 		return $search;
 	}
+	$tokens = array_map(
+		static function ( $t ) {
+			return '+' . $t;
+		},
+		$tokens
+	);
 
 	global $wpdb;
+	// MATCH against the index joined in join_index(), so the table is touched
+	// once for both filtering and ranking. This previously filtered with its own
+	// `ID IN ( SELECT ... MATCH ... )` subquery and then joined the same table a
+	// second time for the ordering, which made MySQL walk the index twice and
+	// cost the most on exactly the searches that match a lot of rows.
 	return $wpdb->prepare(
-		" AND {$wpdb->posts}.ID IN ( SELECT post_id FROM " . table() . " WHERE MATCH(normalized_title, normalized_content) AGAINST (%s IN BOOLEAN MODE) ) ",
+		' AND MATCH(wpsi.normalized_title, wpsi.normalized_content) AGAINST (%s IN BOOLEAN MODE) ',
 		implode( ' ', $tokens )
 	);
 }
 
 /**
- * Join the normalised index, so ranking can be computed on normalised text.
+ * Join the normalised index. Carries both the match and the ranking.
  *
- * Without this the fix is only half done. Core's search ordering boosts posts
+ * Ranking matters as much as matching here. Core's search ordering boosts posts
  * whose RAW title contains the RAW term, which silently stops working for
  * exactly the variant spellings this plugin exists to match: matching would be
- * normalised and relevance would not. A 1:1 join on the primary key, so it
- * cannot duplicate rows.
+ * normalised and relevance would not.
+ *
+ * INNER, not LEFT, because rewrite_search() puts its MATCH on this alias, so a
+ * post with no index row can never satisfy the search anyway. A 1:1 join on the
+ * primary key, so it still cannot duplicate rows.
  */
 function join_index( $join, $query ) {
 	if ( 'index' !== mode() || ! $query->is_search() ) {
@@ -261,7 +303,7 @@ function join_index( $join, $query ) {
 		return $join;
 	}
 	global $wpdb;
-	return $join . ' LEFT JOIN ' . table() . " AS wpsi ON wpsi.post_id = {$wpdb->posts}.ID ";
+	return $join . ' INNER JOIN ' . table() . " AS wpsi ON wpsi.post_id = {$wpdb->posts}.ID ";
 }
 
 /** Rank normalised title matches first, keeping core's semantics on folded text. */
@@ -331,15 +373,31 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				return;
 			}
 			global $wpdb;
-			$rows  = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . table() );
+			$table = table();
+			$rows  = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . $table );
 			$posts = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status NOT IN ('auto-draft','inherit')" );
-			\WP_CLI::log( 'table:  ' . table() );
+			// A row that exists but is out of date. Counting rows cannot see this:
+			// an importer, a migration or a direct SQL write changes the post
+			// without firing save_post, so the index keeps a stale copy and the
+			// totals still add up. A check that only counts is a check that cannot
+			// fail, so compare timestamps too.
+			$stale = (int) $wpdb->get_var(
+				"SELECT COUNT(*) FROM {$wpdb->posts} p
+				 INNER JOIN {$table} i ON i.post_id = p.ID
+				 WHERE p.post_status NOT IN ('auto-draft','inherit')
+				   AND i.updated_at < p.post_modified_gmt"
+			);
+			\WP_CLI::log( 'table:  ' . $table );
 			\WP_CLI::log( "rows:   {$rows} indexed / {$posts} posts" );
+			\WP_CLI::log( "stale:  {$stale}" );
 			if ( $rows < $posts ) {
-				\WP_CLI::error( 'index is behind; run: wp arabic-search reindex' );
+				\WP_CLI::error( sprintf( 'index is behind by %d posts; run: wp arabic-search reindex', $posts - $rows ) );
+			}
+			if ( $stale > 0 ) {
+				\WP_CLI::error( sprintf( '%d indexed posts are stale; run: wp arabic-search reindex', $stale ) );
 			}
 			\WP_CLI::success( 'index is current' );
 		},
-		array( 'shortdesc' => 'Print mode, index size, and exit non-zero if the index is behind.' )
+		array( 'shortdesc' => 'Print mode, index size and stale count, and exit non-zero if the index is behind or stale.' )
 	);
 }

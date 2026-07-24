@@ -188,7 +188,10 @@ function maybe_install(): void {
  */
 function table_exists(): bool {
 	global $wpdb;
-	return (bool) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', table() ) );
+	// esc_like, because `_` is a single-character wildcard in LIKE and this table
+	// name is mostly underscores. Without it the pattern would also match a
+	// same-length table with any characters in those positions.
+	return (bool) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( table() ) ) );
 }
 
 /**

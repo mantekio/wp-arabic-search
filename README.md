@@ -6,6 +6,8 @@ WordPress search is a literal substring test: `LIKE '%term%'` against the title,
 
 This plugin fixes both halves: it folds the variants into one canonical form on **both** the stored text and the query, and it matches against an indexed shadow copy instead of scanning.
 
+> 📖 **Full write-up:** [Arabic search in WordPress: the matches it silently misses](https://www.mantek.io/insights/wordpress-arabic-search)
+
 ## Two modes
 
 Set `WPAS_MODE` in `wp-config.php`:
@@ -146,6 +148,12 @@ matches with: MATCH(search_text) AGAINST ('+مكتبه' IN BOOLEAN MODE)
 - **The index costs disk, in the database.** It holds a second, normalised copy of your searchable text, so budget for it. Measured on a real archive: about 3 KB per article of normalised text (roughly half the raw size, since tags and repeated whitespace are stripped), and about 150 bytes per attachment. A 750,000-row index across a quarter of a million articles and half a million attachments came to about 1.1 GB, of which the `FULLTEXT` index itself was only 17 MB. Attachments were two thirds of the rows and a sixteenth of the bytes, so making your media findable is close to free. Building that index took about 25 minutes at flat memory.
 - **Past a certain size, use a real search engine.** OpenSearch ships an `arabic` analyser that does normalisation, stemming and stopwords properly, and gives relevance ranking a `LIKE` never will. You still want a normaliser there, because the same text problem travels with you.
 
+## How it works
+
+The full reasoning (what WordPress actually does with an Arabic query, the collation that already folds diacritics under `=` and throws that away under `LIKE`, why reaching it still would not be enough, and the measured before and after on a real quarter-million-article archive) is in the write-up:
+
+**→ [Arabic search in WordPress: the matches it silently misses](https://www.mantek.io/insights/wordpress-arabic-search)**
+
 ## Changelog
 
 Every release is documented in the [changelog](https://github.com/mantekio/wp-arabic-search/blob/main/CHANGELOG.md), and the notes for each version are on the [releases page](https://github.com/mantekio/wp-arabic-search/releases).
@@ -153,3 +161,7 @@ Every release is documented in the [changelog](https://github.com/mantekio/wp-ar
 ## License
 
 GPL-2.0-or-later.
+
+---
+
+Built and maintained by **[ManTek Technologies](https://www.mantek.io)**: WordPress + AWS at scale, for newsrooms and beyond.

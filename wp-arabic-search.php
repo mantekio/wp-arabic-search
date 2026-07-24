@@ -208,8 +208,46 @@ function table_exists(): bool {
  * covers both. Kept in one place so reindex and status cannot drift apart again.
  */
 function indexable_where( string $alias = '' ): string {
-	$p = '' === $alias ? '' : $alias . '.';
-	return "{$p}post_status != 'auto-draft' AND {$p}post_type != 'revision'";
+	$p     = '' === $alias ? '' : $alias . '.';
+	$where = "{$p}post_status != 'auto-draft' AND {$p}post_type != 'revision'";
+
+	/**
+	 * Post types to index, or an empty array for "everything except revisions".
+	 *
+	 * Everything is indexed by default, because anything left out is invisible to
+	 * search: this plugin replaces the matching step rather than filtering it. Use
+	 * this to narrow that on a site carrying a large custom post type nobody
+	 * searches, such as a log or an import staging table.
+	 *
+	 * Whatever this returns must also be honoured by is_indexable_post(), or the
+	 * CLI and the save hook would disagree about what belongs in the index.
+	 *
+	 * @param string[] $types
+	 */
+	$types = array_filter( array_map( 'strval', (array) apply_filters( 'wpas_indexed_post_types', array() ) ) );
+	if ( $types ) {
+		global $wpdb;
+		$in     = implode( ',', array_map( array( $wpdb, 'prepare' ), array_fill( 0, count( $types ), '%s' ), $types ) );
+		$where .= " AND {$p}post_type IN ({$in})";
+	}
+
+	return $where;
+}
+
+/**
+ * Does this post belong in the index? The save-hook twin of indexable_where().
+ *
+ * These two have to agree. They did not once before: reindex excluded a status
+ * the hook accepted, and every attachment predating the install silently lost its
+ * row. Any change to one belongs in the other.
+ */
+function is_indexable_post( \WP_Post $post ): bool {
+	if ( 'auto-draft' === $post->post_status || 'revision' === $post->post_type ) {
+		return false;
+	}
+	$types = array_filter( array_map( 'strval', (array) apply_filters( 'wpas_indexed_post_types', array() ) ) );
+
+	return ! $types || in_array( $post->post_type, $types, true );
 }
 
 /**
@@ -223,7 +261,13 @@ function index_post( $post_id ): void {
 		return;
 	}
 	$post = get_post( $post_id );
-	if ( ! $post || 'auto-draft' === $post->post_status ) {
+	if ( ! $post ) {
+		return;
+	}
+	if ( ! is_indexable_post( $post ) ) {
+		// It may have been indexable before (a post type removed from the filter,
+		// or a status change), so clear any row rather than leaving a stale one.
+		unindex_post( $post_id );
 		return;
 	}
 
@@ -328,6 +372,50 @@ function min_token_size(): int {
 }
 
 /**
+ * The server's FULLTEXT stopwords, lowercased, as a lookup map.
+ *
+ * InnoDB refuses to index its stopwords, so a REQUIRED `+the` can only ever match
+ * nothing. Same trap as a token below the length threshold, and the same fix:
+ * drop it, and fall back to core if that leaves the search with nothing.
+ *
+ * The built-in list is English, so on an Arabic archive this rarely bites. It
+ * still has to be handled, because a site can point innodb_ft_server_stopword_table
+ * at its own list, and a search that silently returns nothing is exactly what this
+ * plugin exists to remove.
+ *
+ * Cached in a transient: the list is fixed for a server, and reading it is a query
+ * we should not repeat on every search.
+ */
+function stopwords(): array {
+	static $words = null;
+	if ( null !== $words ) {
+		return $words;
+	}
+
+	$cached = get_transient( 'wpas_stopwords' );
+	if ( is_array( $cached ) ) {
+		$words = $cached;
+		return $words;
+	}
+
+	global $wpdb;
+	$suppress = $wpdb->suppress_errors( true );
+	$rows     = $wpdb->get_col( 'SELECT value FROM INFORMATION_SCHEMA.INNODB_FT_DEFAULT_STOPWORD' );
+	$wpdb->suppress_errors( $suppress );
+
+	$words = array();
+	foreach ( (array) $rows as $w ) {
+		$w = strtolower( trim( (string) $w ) );
+		if ( '' !== $w ) {
+			$words[ $w ] = true;
+		}
+	}
+
+	set_transient( 'wpas_stopwords', $words, WEEK_IN_SECONDS );
+	return $words;
+}
+
+/**
  * Is there anything in the index to search at all?
  *
  * Install the plugin, forget to reindex, and an INNER JOIN against an empty
@@ -377,22 +465,54 @@ function match_tokens( $query ): array {
 	if ( ! index_has_rows() ) {
 		return array();
 	}
-	$min = min_token_size();
+	return array_column( classify_tokens( $term, false ), 'token' );
+}
 
-	return array_values( array_filter(
-		array_map(
-			static function ( $t ) {
-				// Strip boolean-mode operators so a stray character cannot break the query.
-				return preg_replace( '/[+\-><()~*"@]+/u', '', $t );
-			},
-			preg_split( '/\s+/u', $term, -1, PREG_SPLIT_NO_EMPTY )
-		),
-		static function ( $t ) use ( $min ) {
+/**
+ * Split a normalised term into tokens, recording what happened to each.
+ *
+ * Kept separate from match_tokens() so `wp arabic-search explain` can report the
+ * reason a token was dropped rather than only the survivors. "Why did this not
+ * match?" is the question this plugin will be asked most, and answering it should
+ * not require reading the source.
+ *
+ * @return array<int, array{token: string, kept: bool, reason: string}>
+ */
+function classify_tokens( string $term, bool $include_dropped = true ): array {
+	$min   = min_token_size();
+	$stop  = stopwords();
+	$out   = array();
+
+	foreach ( preg_split( '/\s+/u', $term, -1, PREG_SPLIT_NO_EMPTY ) as $raw ) {
+		// Strip boolean-mode operators so a stray character cannot break the query.
+		$token = preg_replace( '/[+\-><()~*"@]+/u', '', $raw );
+
+		if ( '' === $token ) {
+			$kept   = false;
+			$reason = 'empty after stripping boolean operators';
+		} elseif ( mb_strlen( $token, 'UTF-8' ) < $min ) {
 			// mb_strlen, not strlen: an Arabic character is two bytes, so a byte
 			// count waves through exactly the short tokens FULLTEXT refuses to index.
-			return mb_strlen( $t, 'UTF-8' ) >= $min;
+			$kept   = false;
+			$reason = sprintf( 'shorter than innodb_ft_min_token_size (%d)', $min );
+		} elseif ( isset( $stop[ strtolower( $token ) ] ) ) {
+			$kept   = false;
+			$reason = 'a FULLTEXT stopword, which is never indexed';
+		} else {
+			$kept   = true;
+			$reason = 'indexable';
 		}
-	) );
+
+		if ( $kept || $include_dropped ) {
+			$out[] = array(
+				'token'  => $token,
+				'kept'   => $kept,
+				'reason' => $reason,
+			);
+		}
+	}
+
+	return $out;
 }
 
 /**
@@ -493,8 +613,78 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	);
 
 	\WP_CLI::add_command(
+		'arabic-search explain',
+		function ( $args ) {
+			$raw = isset( $args[0] ) ? (string) $args[0] : '';
+			if ( '' === $raw ) {
+				\WP_CLI::error( 'usage: wp arabic-search explain "<search term>"' );
+			}
+			$normalised = normalize( $raw );
+
+			\WP_CLI::log( 'mode:        ' . mode() );
+			\WP_CLI::log( 'raw:         ' . $raw );
+			\WP_CLI::log( 'normalised:  ' . $normalised );
+
+			if ( 'index' !== mode() ) {
+				\WP_CLI::warning( 'normaliser mode: this plugin does not answer searches, so WordPress runs its own.' );
+				return;
+			}
+
+			$rows = classify_tokens( $normalised );
+			\WP_CLI::log( '' );
+			\WP_CLI\Utils\format_items(
+				'table',
+				array_map(
+					static function ( $r ) {
+						return array(
+							'token'  => $r['token'],
+							'used'   => $r['kept'] ? 'yes' : 'no',
+							'reason' => $r['reason'],
+						);
+					},
+					$rows
+				),
+				array( 'token', 'used', 'reason' )
+			);
+
+			$kept = array_column( array_filter( $rows, static function ( $r ) {
+				return $r['kept'];
+			} ), 'token' );
+
+			\WP_CLI::log( '' );
+			if ( ! table_exists() ) {
+				\WP_CLI::warning( 'the index table does not exist, so this search falls back to WordPress. Run: wp arabic-search reindex' );
+				return;
+			}
+			if ( ! index_has_rows() ) {
+				\WP_CLI::warning( 'the index is empty, so this search falls back to WordPress. Run: wp arabic-search reindex' );
+				return;
+			}
+			if ( ! $kept ) {
+				\WP_CLI::warning( 'no usable tokens, so this search falls back to WordPress\'s own LIKE and returns exactly what core returns.' );
+				return;
+			}
+
+			$against = '+' . implode( ' +', $kept );
+			\WP_CLI::log( 'matches with: MATCH(search_text) AGAINST (\'' . $against . '\' IN BOOLEAN MODE)' );
+			\WP_CLI::log( 'ranked by:    normalized_title LIKE \'%' . $normalised . '%\' DESC, post_date DESC' );
+
+			global $wpdb;
+			$hits = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					'SELECT COUNT(*) FROM ' . table() . ' WHERE MATCH(search_text) AGAINST (%s IN BOOLEAN MODE)',
+					$against
+				)
+			);
+			\WP_CLI::log( 'index hits:   ' . $hits );
+			\WP_CLI::success( 'explained' );
+		},
+		array( 'shortdesc' => 'Show how a search term is folded, which tokens are used, and what it matches.' )
+	);
+
+	\WP_CLI::add_command(
 		'arabic-search reindex',
-		function () {
+		function ( $args, $assoc ) {
 			if ( 'index' !== mode() ) {
 				\WP_CLI::error( 'reindex only applies in index mode (WPAS_MODE is "normaliser")' );
 			}
@@ -511,28 +701,105 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			}
 
 			global $wpdb;
-			$ids   = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE " . indexable_where() );
-			$total = count( $ids );
-			$bar   = \WP_CLI\Utils\make_progress_bar( "Indexing {$total} posts", $total );
-			foreach ( $ids as $id ) {
-				index_post( $id );
-				$bar->tick();
+			$where = indexable_where();
+			$total = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE {$where}" );
+
+			$batch = max( 1, (int) ( $assoc['batch'] ?? 1000 ) );
+			$after = max( 0, (int) ( $assoc['after'] ?? 0 ) );
+			$prune = ! empty( $assoc['prune'] );
+
+			if ( $after ) {
+				\WP_CLI::log( "resuming after post ID {$after}" );
 			}
+
+			// Walk by primary key in batches rather than loading every ID at once.
+			// The old version did SELECT ID for the whole table into one PHP array,
+			// which is the wrong shape for the archives this plugin is aimed at: a
+			// quarter of a million rows is survivable, a million is not, and a
+			// failure at row 900,000 had to start again from zero. Keyset paging on
+			// ID (not OFFSET, which rescans) keeps memory flat and makes --after a
+			// real resume point.
+			$done = 0;
+			$bar  = \WP_CLI\Utils\make_progress_bar( "Indexing {$total} posts", $total );
+			do {
+				$ids = $wpdb->get_col(
+					$wpdb->prepare(
+						"SELECT ID FROM {$wpdb->posts} WHERE {$where} AND ID > %d ORDER BY ID ASC LIMIT %d",
+						$after,
+						$batch
+					)
+				);
+				foreach ( $ids as $id ) {
+					index_post( $id );
+					$after = (int) $id;
+					++$done;
+					$bar->tick();
+				}
+				// Free the object cache between batches, or a long run grows until
+				// it dies, and every post we just touched is cached for nothing.
+				if ( function_exists( 'wp_cache_flush_runtime' ) ) {
+					wp_cache_flush_runtime();
+				}
+			} while ( count( $ids ) === $batch );
 			$bar->finish();
+
+			if ( $prune ) {
+				// Rows whose post is gone or is no longer indexable. Harmless while
+				// they sit there, since the join simply never matches them, but they
+				// make the counts drift, and status compares counts.
+				$removed = (int) $wpdb->query(
+					"DELETE i FROM " . table() . " i
+					 LEFT JOIN {$wpdb->posts} p
+					        ON p.ID = i.post_id AND " . indexable_where( 'p' ) . "
+					 WHERE p.ID IS NULL"
+				);
+				\WP_CLI::log( "pruned {$removed} orphaned rows" );
+			}
 
 			// Count what landed, not what we set out to write. This used to report
 			// the number of posts SELECTED, so every single write could fail and the
 			// command still announced a full success. A command that cannot fail is
-			// not a check. Rows may legitimately exceed $total, since reindex does
-			// not prune rows for posts that are no longer indexable, so only a
-			// shortfall is an error.
-			$written = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . table() );
-			if ( $written < $total ) {
-				\WP_CLI::error( sprintf( 'indexed %d of %d posts; %d writes did not land', $written, $total, $total - $written ) );
+			// not a check.
+			//
+			// Compare against the rows this run was responsible for, not the whole
+			// table: with --after we deliberately index a subset, and a full-table
+			// comparison would call a correct resume a failure. Rows can also exceed
+			// the count legitimately, since old rows survive unless --prune is given,
+			// so only a shortfall is an error.
+			$written = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					'SELECT COUNT(*) FROM ' . table() . ' WHERE post_id <= %d',
+					$after
+				)
+			);
+			if ( $written < $done ) {
+				\WP_CLI::error( sprintf( 'indexed %d of %d posts; %d writes did not land', $written, $done, $done - $written ) );
 			}
-			\WP_CLI::success( "indexed {$total} posts" );
+			\WP_CLI::success( "indexed {$done} posts" );
 		},
-		array( 'shortdesc' => 'Rebuild the normalised index for every post.' )
+		array(
+			'shortdesc' => 'Rebuild the normalised index for every post.',
+			'synopsis'  => array(
+				array(
+					'type'        => 'assoc',
+					'name'        => 'batch',
+					'description' => 'Posts per batch. Default 1000.',
+					'optional'    => true,
+				),
+				array(
+					'type'        => 'assoc',
+					'name'        => 'after',
+					'description' => 'Resume after this post ID, for restarting a long run.',
+					'optional'    => true,
+				),
+				array(
+					'type'        => 'flag',
+					'name'        => 'prune',
+					'description' => 'Also delete index rows whose post is gone or is no longer indexable.',
+					'optional'    => true,
+				),
+			),
+		)
 	);
 
 	\WP_CLI::add_command(

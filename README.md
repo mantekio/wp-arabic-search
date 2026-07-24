@@ -69,6 +69,16 @@ add_filter( 'wpas_searchable_parts', function ( $parts, $post ) {
 }, 10, 2 );
 ```
 
+Everything is indexed by default, deliberately, because anything left out is invisible to search. If a site carries a large custom post type nobody searches, a log or an import staging table, narrow it:
+
+```php
+add_filter( 'wpas_indexed_post_types', function () {
+    return array( 'post', 'page', 'attachment' );
+} );
+```
+
+Then run `wp arabic-search reindex --prune` to drop the rows for types you just excluded.
+
 The index table is `{your_prefix}search_index`. On multisite each site gets its own, alongside its own posts table. Rename it with the `wpas_table_basename` filter if it ever collides with something else.
 
 ## What the normaliser does
@@ -95,15 +105,35 @@ wp arabic-search normalize "مُحَمَّد"
 ## Commands
 
 - `wp arabic-search normalize "<term>"` shows what a term folds to. Works in both modes.
-- `wp arabic-search reindex` rebuilds the index (index mode).
+- `wp arabic-search explain "<term>"` answers "why did this not match?", which is the question this plugin gets asked most. It prints the folded form, every token with whether it was used and why not, whether the search falls back to core, the exact `MATCH ... AGAINST` it will run, and how many rows in the index that matches.
+- `wp arabic-search reindex` rebuilds the index (index mode). It walks by primary key in batches, so memory stays flat on a large archive.
+  - `--batch=<n>` posts per batch (default 1000).
+  - `--after=<id>` resume after a post ID, so an interrupted run does not start again from zero.
+  - `--prune` also delete rows whose post is gone or is no longer indexable.
 - `wp arabic-search status` prints the mode, index size and stale count, and exits non-zero if the index is behind or stale. Stale means the row exists but the post changed without `save_post` firing, which an importer, a migration or a direct SQL write will do, and which a row count alone cannot see. Future-dated posts are ignored, so scheduled content does not report stale for ever.
+
+```
+$ wp arabic-search explain "من المكتبة"
+mode:        index
+raw:         من المكتبة
+normalised:  من مكتبه
+
++--------+------+--------------------------------------------------+
+| token  | used | reason                                           |
++--------+------+--------------------------------------------------+
+| من     | no   | shorter than innodb_ft_min_token_size (3)        |
+| مكتبه  | yes  | indexable                                        |
++--------+------+--------------------------------------------------+
+
+matches with: MATCH(search_text) AGAINST ('+مكتبه' IN BOOLEAN MODE)
+```
 
 ## Known limits
 
 - **Single-letter prefixes are deliberately not stripped.** Removing و ف ب ك ل looks tempting and is destructive, because those letters also begin ordinary words: كتاب would become تاب, بيت would become يت, and فكرة would become كرة, a different word entirely. So وكتاب will not match كتاب. Real prefix handling needs morphology, which is out of scope.
 - **Light folding is not stemming.** كتاب will not find its broken plural كتب, because Arabic plurals rewrite the word rather than append to it. That needs a root dictionary.
 - **Folding is lossy on purpose.** Merging ة into ه, or ى into ي, will occasionally merge two genuinely different words. For archive search that trade is nearly always worth it, but it is a trade: it is filterable, so decide deliberately.
-- **Words shorter than the index threshold fall back to core.** InnoDB does not index tokens below `innodb_ft_min_token_size`, which is 3 by default and so covers common two-letter Arabic words like من, في and ما. Rather than require a token the index does not hold, and return nothing, the plugin hands those searches straight back to WordPress's own `LIKE`, and results then match core exactly. In a mixed query the short token is dropped and the longer ones still match. No server change is needed for this: `innodb_ft_min_token_size` is a static setting that needs a MySQL restart and a rebuild of every FULLTEXT index on the server, and it buys nothing for correctness.
+- **Words the index cannot hold fall back to core.** Two kinds: tokens below `innodb_ft_min_token_size` (3 by default, which covers common two-letter Arabic words like من, في and ما), and FULLTEXT stopwords, which InnoDB refuses to index at all. Rather than require a token the index does not hold, and so return nothing, the plugin hands those searches straight back to WordPress's own `LIKE`, and results then match core exactly. In a mixed query the unusable token is dropped and the longer ones still match. `wp arabic-search explain` shows exactly which happened. The built-in stopword list is English, so it rarely bites an Arabic archive, but a site can point `innodb_ft_server_stopword_table` at its own. No server change is needed for this: `innodb_ft_min_token_size` is a static setting that needs a MySQL restart and a rebuild of every FULLTEXT index on the server, and it buys nothing for correctness.
 - **That "never worse than core" guarantee is scoped to the fallback path.** A search that falls back returns exactly what core returns. A search answered from the index returns what the index holds, so a post whose row is missing will not be found, which is true of every index-backed search and is exactly what `wp arabic-search status` exists to catch. Keep the index current and the two paths agree; let it drift and only the fallback is still identical to core.
 - **Ranking is a title boost, not relevance scoring.** Matching and ranking are both done on normalised text, so the two agree, but ranking is still core's binary "does the title contain the term" rather than a real relevance score.
 - **It is dramatically faster, with one narrow exception.** Measured on 50,000 posts: a selective search went from about 210 ms to 5 ms, roughly forty times faster, and returned matches that previously returned nothing. It stays ahead as the match count climbs, and even a term matching all 50,000 rows is faster through the index (about 205 ms against 300 ms). The exception needs two things at once: a term sitting at the very start of every document, so `LIKE` matches on the first bytes and abandons each row immediately, *and* a match count near the whole archive. Given both, the scan gets its best possible case and wins, about 135 ms against 212 ms. Measured crossover: the index wins until roughly 70% of the archive matches, and only loses beyond that when the scan also gets that early exit. Against a term the scan has to read in full, the index wins across the entire range.

@@ -4,6 +4,63 @@ All notable changes to **WP Arabic Search** are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3]
+
+First release verified against a real archive rather than a seeded one: about a
+quarter of a million articles and half a million attachments, 758,852 rows.
+
+### Fixed
+- **`status` could report a healthy index while posts were unsearchable.** It
+  inferred everything from one comparison, `rows < posts`, which is not the same
+  question as "is any post unindexed". Orphaned rows inflate the row count, so an
+  index missing fifteen posts while carrying fifteen orphans had totals that
+  matched exactly and reported itself current. Confirmed as a real fault, not
+  merely a reporting gap: the plugin returned 30 posts where core returned 31,
+  and `status` said nothing. It now counts **missing**, **stale** and **orphans**
+  separately. Missing and stale fail; orphans warn without failing, since the
+  join never matches them.
+- **`status` never mentioned orphaned rows at all**, which meant the one
+  condition `--prune` exists to clear was the one condition it stayed silent
+  about.
+- **The stopword list fell back to nothing when it could not be read.** Reading
+  the server list needs the `PROCESS` privilege, which plenty of managed hosts do
+  not grant, and the error was suppressed. The fix would then have been present
+  and doing nothing. It now falls back to InnoDB's documented default list, and
+  `status` and `explain` say when the fallback is in use.
+
+### Added
+- **FULLTEXT stopwords are dropped like unusably short tokens.** InnoDB refuses
+  to index its stopwords, so a required `+the` could only ever match nothing
+  while core answered the same search normally. Same failure as the two-letter
+  Arabic word fixed in 0.9.1, and the same remedy: drop the token, and fall back
+  to core if none survive.
+- **`wp arabic-search explain "<term>"`** answers "why did this not match?",
+  which previously meant reading the source. It prints the folded form, every
+  token with whether it was used and why not, whether the search falls back to
+  core, the exact `MATCH ... AGAINST` clause it will run, and the live index hit
+  count.
+- **`wpas_indexed_post_types`** narrows what gets indexed, for a site carrying a
+  large custom post type nobody searches. Everything is indexed by default,
+  because anything left out is invisible to search.
+- **`reindex --batch`, `--after` and `--prune`.**
+
+### Changed
+- **`reindex` walks by primary key in batches** rather than loading every post ID
+  into one array, which was the wrong shape for the archives this plugin is aimed
+  at: a failure at post 900,000 started again from zero. Keyset paging, not
+  `OFFSET`, which rescans and degrades as it goes. Peak memory on 50,000 posts
+  fell from 253 MB to 82 MB, and stays flat as the archive grows. `--after`
+  resumes an interrupted run; `--prune` clears rows whose post is gone or is no
+  longer indexable.
+
+### Measured
+On a real archive of about 250,000 Arabic articles: a search for a name written
+with diacritics returned **1** result through WordPress and **28,238** through
+this plugin, in 0.55 s against 4.8 s. Searches the index cannot answer, such as a
+two-letter word, fall back to core and return identically in identical time. The
+index came to about 1.1 GB, roughly 3 KB per article and 150 bytes per
+attachment, of which the `FULLTEXT` index itself was 17 MB.
+
 ## [0.9.2]
 
 **Upgrading: run `wp arabic-search reindex` after updating.** The index is
@@ -108,6 +165,7 @@ non-zero. Nothing returns wrong results in the meantime.
     can fold its text and its queries with the same code.
   - **WP-CLI:** `normalize`, `reindex` and `status`.
 
+[0.9.3]: https://github.com/mantekio/wp-arabic-search/releases/tag/v0.9.3
 [0.9.2]: https://github.com/mantekio/wp-arabic-search/releases/tag/v0.9.2
 [0.9.1]: https://github.com/mantekio/wp-arabic-search/releases/tag/v0.9.1
 [0.9.0]: https://github.com/mantekio/wp-arabic-search/releases/tag/v0.9.0

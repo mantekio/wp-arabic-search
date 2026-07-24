@@ -50,6 +50,10 @@ Then build the index once (index mode only):
 wp arabic-search reindex
 ```
 
+Nothing walks your archive when you activate the plugin, so that one command is what backfills everything you already have. After it, every save keeps its own row current. Skip it and the plugin notices the index is empty and stands aside, letting core answer your searches, rather than answering all of them with nothing.
+
+**What gets indexed:** every post except revisions, autosaves and auto-drafts. That deliberately includes drafts, pending, scheduled, private and trashed posts, and attachments. Editors search those in wp-admin, and this plugin *replaces* the matching step rather than filtering it, so anything without a row is invisible to search. What a **visitor** can see is still WordPress's decision: it applies its own `post_status` rules on top, and the plugin never touches them.
+
 The index table is `{your_prefix}search_index`. On multisite each site gets its own, alongside its own posts table. Rename it with the `wpas_table_basename` filter if it ever collides with something else.
 
 ## What the normaliser does

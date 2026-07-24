@@ -159,6 +159,24 @@ function maybe_install(): void {
 }
 
 /**
+ * The SQL predicate for "a post this plugin indexes".
+ *
+ * index_post() skips revisions, autosaves and auto-drafts, and takes everything
+ * else, so the CLI has to select exactly that set or the two disagree. They did:
+ * reindex excluded post_status 'inherit' as a way of skipping revisions, and
+ * attachments use that status too, so a full reindex left every attachment that
+ * predated the install with no row while newly uploaded ones still got one, and
+ * a Media Library search quietly lost the older half.
+ *
+ * Autosaves are revisions as well (post_type 'revision'), so the type test
+ * covers both. Kept in one place so reindex and status cannot drift apart again.
+ */
+function indexable_where( string $alias = '' ): string {
+	$p = '' === $alias ? '' : $alias . '.';
+	return "{$p}post_status != 'auto-draft' AND {$p}post_type != 'revision'";
+}
+
+/**
  * Normalise one post and, in index mode, store it. The action fires in BOTH
  * modes: it is the seam an external pipeline hooks to push the same normalised
  * text into its own store.
@@ -236,6 +254,33 @@ function min_token_size(): int {
 }
 
 /**
+ * Is there anything in the index to search at all?
+ *
+ * Install the plugin, forget to reindex, and an INNER JOIN against an empty
+ * table answers every single search with nothing: precisely the silent failure
+ * this plugin exists to remove, reintroduced by the plugin itself. So an index
+ * that is empty, or a table that is not there yet, means we stand aside and let
+ * core answer.
+ *
+ * Only the empty case is caught here, deliberately. Comparing row counts on
+ * every search to spot a partially built index would cost more than the search,
+ * and `wp arabic-search status` already reports that kind of drift. Checked once
+ * per request with an index-only lookup rather than a COUNT.
+ */
+function index_has_rows(): bool {
+	static $has = null;
+	if ( null !== $has ) {
+		return $has;
+	}
+	global $wpdb;
+	$suppress = $wpdb->suppress_errors( true );
+	$row      = $wpdb->get_var( 'SELECT 1 FROM ' . table() . ' LIMIT 1' );
+	$wpdb->suppress_errors( $suppress );
+	$has = ( null !== $row );
+	return $has;
+}
+
+/**
  * The boolean-mode tokens for this query, or an empty array when the search
  * cannot be answered from the index and has to fall back to core.
  *
@@ -253,6 +298,9 @@ function match_tokens( $query ): array {
 	}
 	$term = normalize( (string) $query->get( 's' ) );
 	if ( '' === $term ) {
+		return array();
+	}
+	if ( ! index_has_rows() ) {
 		return array();
 	}
 	$min = min_token_size();
@@ -378,7 +426,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			}
 			maybe_install();
 			global $wpdb;
-			$ids   = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE post_status NOT IN ('auto-draft','inherit')" );
+			$ids   = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE " . indexable_where() );
 			$total = count( $ids );
 			$bar   = \WP_CLI\Utils\make_progress_bar( "Indexing {$total} posts", $total );
 			foreach ( $ids as $id ) {
@@ -403,7 +451,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			global $wpdb;
 			$table = table();
 			$rows  = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . $table );
-			$posts = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_status NOT IN ('auto-draft','inherit')" );
+			$posts = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE " . indexable_where() );
 			// A row that exists but is out of date. Counting rows cannot see this:
 			// an importer, a migration or a direct SQL write changes the post
 			// without firing save_post, so the index keeps a stale copy and the
@@ -418,7 +466,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			$stale = (int) $wpdb->get_var(
 				"SELECT COUNT(*) FROM {$wpdb->posts} p
 				 INNER JOIN {$table} i ON i.post_id = p.ID
-				 WHERE p.post_status NOT IN ('auto-draft','inherit')
+				 WHERE " . indexable_where( 'p' ) . "
 				   AND p.post_modified_gmt <= UTC_TIMESTAMP()
 				   AND i.updated_at < p.post_modified_gmt"
 			);

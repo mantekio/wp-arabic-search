@@ -56,7 +56,7 @@ Nothing walks your archive when you activate the plugin, so that one command is 
 
 **Which posts:** every one except revisions, autosaves and auto-drafts. That deliberately includes drafts, pending, scheduled, private and trashed posts, and attachments. Editors search those in wp-admin, and this plugin *replaces* the matching step rather than filtering it, so anything without a row is invisible to search. What a **visitor** can see is still WordPress's decision: it applies its own `post_status` rules on top, and the plugin never touches them.
 
-**Which text:** title, excerpt and content, folded into one indexed column, so a word counts wherever it appears. Core searches those same three fields, so anything less would answer worse than the search being replaced. Attachments contribute their **alt text** and **filename** as well, which is what keeps a Media Library search working, since core matches filenames through a separate filter that our rewrite leaves nothing for.
+**Which text:** title, excerpt and content, folded into one indexed column, so a word counts wherever it appears. Core searches those same three fields, so anything less would answer worse than the search being replaced. Attachments contribute their **caption**, **alt text** and **filename** too. Filename matters because core matches it through a separate filter that rewrites core's own `LIKE` clause, which our rewrite leaves nothing to hook onto, so indexing it ourselves is the only way a Media Library search keeps working. Alt text goes further than core, which does not search it at all.
 
 Anything else goes in through one filter, with no schema change, because it all lands in the same column:
 

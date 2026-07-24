@@ -174,6 +174,24 @@ function maybe_install(): void {
 }
 
 /**
+ * Is the index table actually there?
+ *
+ * The stored schema version says only what we last created, never what still
+ * exists. Drop the table (a botched restore, a migration, a careless cleanup)
+ * and maybe_install() sees a matching version and does nothing.
+ *
+ * Deliberately not called from maybe_install(), which runs on every init: that
+ * would put a SHOW TABLES on every page load to catch something that almost
+ * never happens. The search path is already safe without it, because
+ * index_has_rows() cannot read a missing table and so falls back to core. This
+ * is for the CLI, where the check is free and the lie was loudest.
+ */
+function table_exists(): bool {
+	global $wpdb;
+	return (bool) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', table() ) );
+}
+
+/**
  * The SQL predicate for "a post this plugin indexes".
  *
  * index_post() skips revisions, autosaves and auto-drafts, and takes everything
@@ -478,6 +496,17 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				\WP_CLI::error( 'reindex only applies in index mode (WPAS_MODE is "normaliser")' );
 			}
 			maybe_install();
+			// maybe_install() trusts the stored version, so a table that has been
+			// dropped out from under it is not noticed. Clear the version and let
+			// it build again.
+			if ( ! table_exists() ) {
+				delete_option( SCHEMA_OPTION );
+				maybe_install();
+				if ( ! table_exists() ) {
+					\WP_CLI::error( 'index table ' . table() . ' is missing and could not be created' );
+				}
+			}
+
 			global $wpdb;
 			$ids   = $wpdb->get_col( "SELECT ID FROM {$wpdb->posts} WHERE " . indexable_where() );
 			$total = count( $ids );
@@ -487,6 +516,17 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				$bar->tick();
 			}
 			$bar->finish();
+
+			// Count what landed, not what we set out to write. This used to report
+			// the number of posts SELECTED, so every single write could fail and the
+			// command still announced a full success. A command that cannot fail is
+			// not a check. Rows may legitimately exceed $total, since reindex does
+			// not prune rows for posts that are no longer indexable, so only a
+			// shortfall is an error.
+			$written = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . table() );
+			if ( $written < $total ) {
+				\WP_CLI::error( sprintf( 'indexed %d of %d posts; %d writes did not land', $written, $total, $total - $written ) );
+			}
 			\WP_CLI::success( "indexed {$total} posts" );
 		},
 		array( 'shortdesc' => 'Rebuild the normalised index for every post.' )
@@ -503,6 +543,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			}
 			global $wpdb;
 			$table = table();
+			if ( ! table_exists() ) {
+				\WP_CLI::log( 'table:  ' . $table );
+				\WP_CLI::error( 'index table does not exist; run: wp arabic-search reindex' );
+			}
 			$rows  = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . $table );
 			$posts = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE " . indexable_where() );
 			// A row that exists but is out of date. Counting rows cannot see this:

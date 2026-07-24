@@ -3,7 +3,7 @@
  * Plugin Name: WP Arabic Search
  * Plugin URI:  https://github.com/mantekio/wp-arabic-search
  * Description: Makes WordPress search actually match Arabic. Normalises diacritics, tatweel, alef and hamza forms on both the stored text and the query, and searches an indexed shadow copy instead of an unindexed LIKE scan. Works standalone, or as a normaliser only when you index somewhere else.
- * Version:     0.9.0
+ * Version:     0.9.1
  * Author:      Jaafar Abazid
  * Author URI:  https://www.mantek.io
  * License:     GPL-2.0-or-later

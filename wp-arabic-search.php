@@ -227,49 +227,61 @@ function min_token_size(): int {
 }
 
 /**
+ * The boolean-mode tokens for this query, or an empty array when the search
+ * cannot be answered from the index and has to fall back to core.
+ *
+ * Deliberately the ONLY place that decision is made. rewrite_search(),
+ * join_index() and order_by_normalized() must all reach the same answer, and
+ * while each decided for itself they disagreed in two ways that both broke
+ * search: a join added without a matching MATCH silently intersected core's
+ * fallback with the set of indexed posts, so a post missing from the index
+ * vanished from results core would have returned; and an ORDER BY naming the
+ * `wpsi` alias when no join was added is a SQL error.
+ */
+function match_tokens( $query ): array {
+	if ( 'index' !== mode() || ! $query->is_search() ) {
+		return array();
+	}
+	$term = normalize( (string) $query->get( 's' ) );
+	if ( '' === $term ) {
+		return array();
+	}
+	$min = min_token_size();
+
+	return array_values( array_filter(
+		array_map(
+			static function ( $t ) {
+				// Strip boolean-mode operators so a stray character cannot break the query.
+				return preg_replace( '/[+\-><()~*"@]+/u', '', $t );
+			},
+			preg_split( '/\s+/u', $term, -1, PREG_SPLIT_NO_EMPTY )
+		),
+		static function ( $t ) use ( $min ) {
+			// mb_strlen, not strlen: an Arabic character is two bytes, so a byte
+			// count waves through exactly the short tokens FULLTEXT refuses to index.
+			return mb_strlen( $t, 'UTF-8' ) >= $min;
+		}
+	) );
+}
+
+/**
  * Replace WordPress's LIKE search with a lookup against the normalised index.
  *
  * The query is put through the identical normaliser, then matched with
  * FULLTEXT in boolean mode with every token required, which mirrors the AND
  * behaviour of core's search rather than loosening it.
  *
- * Tokens too short for the index are dropped, and if that leaves nothing we
- * hand the query back to core untouched. The rule is that this plugin must
- * never answer worse than the search it replaces: a two-letter Arabic word
- * like من or في is below InnoDB's default threshold, so requiring it would
- * turn a search core answers perfectly well into an empty page.
+ * With no usable tokens the search is handed back to core untouched. The rule
+ * is that this plugin must never answer worse than the search it replaces: a
+ * two-letter Arabic word like من or في is below InnoDB's default threshold, so
+ * requiring it would turn a search core answers perfectly well into an empty
+ * page.
  */
 function rewrite_search( $search, $query ) {
-	if ( 'index' !== mode() || ! $query->is_search() ) {
-		return $search;
-	}
-	$term = normalize( (string) $query->get( 's' ) );
-	if ( '' === $term ) {
-		return $search;
-	}
-
-	$min    = min_token_size();
-	$tokens = preg_split( '/\s+/u', $term, -1, PREG_SPLIT_NO_EMPTY );
-	$tokens = array_filter( array_map(
-		static function ( $t ) {
-			// Strip boolean-mode operators so a stray character cannot break the query.
-			return preg_replace( '/[+\-><()~*"@]+/u', '', $t );
-		},
-		$tokens
-	), static function ( $t ) use ( $min ) {
-		// mb_strlen, not strlen: an Arabic character is two bytes, so a byte
-		// count waves through exactly the short tokens FULLTEXT refuses to index.
-		return mb_strlen( $t, 'UTF-8' ) >= $min;
-	} );
+	$tokens = match_tokens( $query );
 	if ( ! $tokens ) {
 		return $search;
 	}
-	$tokens = array_map(
-		static function ( $t ) {
-			return '+' . $t;
-		},
-		$tokens
-	);
 
 	global $wpdb;
 	// MATCH against the index joined in join_index(), so the table is touched
@@ -279,7 +291,7 @@ function rewrite_search( $search, $query ) {
 	// cost the most on exactly the searches that match a lot of rows.
 	return $wpdb->prepare(
 		' AND MATCH(wpsi.normalized_title, wpsi.normalized_content) AGAINST (%s IN BOOLEAN MODE) ',
-		implode( ' ', $tokens )
+		'+' . implode( ' +', $tokens )
 	);
 }
 
@@ -293,28 +305,35 @@ function rewrite_search( $search, $query ) {
  *
  * INNER, not LEFT, because rewrite_search() puts its MATCH on this alias, so a
  * post with no index row can never satisfy the search anyway. A 1:1 join on the
- * primary key, so it still cannot duplicate rows.
+ * primary key, so it still cannot duplicate rows. INNER also keeps the index as
+ * the driving table, which is what lets MySQL lead with the FULLTEXT index; a
+ * LEFT JOIN would force wp_posts to drive and throw that plan away.
+ *
+ * Skipped entirely when the search falls back to core, because otherwise the
+ * join quietly filters core's own results down to whatever happens to be
+ * indexed, and an unindexed post disappears from a search core would have
+ * answered.
  */
 function join_index( $join, $query ) {
-	if ( 'index' !== mode() || ! $query->is_search() ) {
-		return $join;
-	}
-	if ( '' === normalize( (string) $query->get( 's' ) ) ) {
+	if ( ! match_tokens( $query ) ) {
 		return $join;
 	}
 	global $wpdb;
 	return $join . ' INNER JOIN ' . table() . " AS wpsi ON wpsi.post_id = {$wpdb->posts}.ID ";
 }
 
-/** Rank normalised title matches first, keeping core's semantics on folded text. */
+/**
+ * Rank normalised title matches first, keeping core's semantics on folded text.
+ *
+ * Gated on the same token test as the join: when the search falls back to core
+ * no `wpsi` alias exists, and naming it here would be a SQL error rather than a
+ * missing boost.
+ */
 function order_by_normalized( $orderby, $query ) {
-	if ( 'index' !== mode() || ! $query->is_search() ) {
+	if ( ! match_tokens( $query ) ) {
 		return $orderby;
 	}
 	$term = normalize( (string) $query->get( 's' ) );
-	if ( '' === $term ) {
-		return $orderby;
-	}
 	global $wpdb;
 	return $wpdb->prepare( 'wpsi.normalized_title LIKE %s DESC', '%' . $wpdb->esc_like( $term ) . '%' );
 }
@@ -381,10 +400,17 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			// without firing save_post, so the index keeps a stale copy and the
 			// totals still add up. A check that only counts is a check that cannot
 			// fail, so compare timestamps too.
+			//
+			// Ignore future timestamps. A scheduled post carries a post_modified_gmt
+			// in the future, which index_post() (stamping "now") can never reach, so
+			// without this guard every site publishing on a schedule reports stale
+			// for ever and a red status becomes noise to scroll past. It also
+			// absorbs clock skew between the app and database hosts.
 			$stale = (int) $wpdb->get_var(
 				"SELECT COUNT(*) FROM {$wpdb->posts} p
 				 INNER JOIN {$table} i ON i.post_id = p.ID
 				 WHERE p.post_status NOT IN ('auto-draft','inherit')
+				   AND p.post_modified_gmt <= UTC_TIMESTAMP()
 				   AND i.updated_at < p.post_modified_gmt"
 			);
 			\WP_CLI::log( 'table:  ' . $table );

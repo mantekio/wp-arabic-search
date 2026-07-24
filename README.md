@@ -20,8 +20,10 @@ define( 'WPAS_MODE', 'normaliser' );
 **`normaliser`** maintains nothing and rewrites nothing. It exposes the normaliser and fires an action every time a post's text is recomputed, so your own pipeline can push the normalised text into wherever you actually index (an external table, OpenSearch, a search service). Use this when search does not run inside WordPress.
 
 ```php
-add_action( 'wpas_post_normalized', function ( $post_id, $title, $content ) {
-    // send $title and $content to your own index
+add_action( 'wpas_post_normalized', function ( $post_id, $title, $search_text ) {
+    // $search_text is everything searchable about the post, already folded:
+    // title, excerpt, content, and whatever `wpas_searchable_parts` added.
+    // Send it to your own index.
 }, 10, 3 );
 
 // and normalise the incoming query with the identical function before you match:
@@ -52,7 +54,20 @@ wp arabic-search reindex
 
 Nothing walks your archive when you activate the plugin, so that one command is what backfills everything you already have. After it, every save keeps its own row current. Skip it and the plugin notices the index is empty and stands aside, letting core answer your searches, rather than answering all of them with nothing.
 
-**What gets indexed:** every post except revisions, autosaves and auto-drafts. That deliberately includes drafts, pending, scheduled, private and trashed posts, and attachments. Editors search those in wp-admin, and this plugin *replaces* the matching step rather than filtering it, so anything without a row is invisible to search. What a **visitor** can see is still WordPress's decision: it applies its own `post_status` rules on top, and the plugin never touches them.
+**Which posts:** every one except revisions, autosaves and auto-drafts. That deliberately includes drafts, pending, scheduled, private and trashed posts, and attachments. Editors search those in wp-admin, and this plugin *replaces* the matching step rather than filtering it, so anything without a row is invisible to search. What a **visitor** can see is still WordPress's decision: it applies its own `post_status` rules on top, and the plugin never touches them.
+
+**Which text:** title, excerpt and content, folded into one indexed column, so a word counts wherever it appears. Core searches those same three fields, so anything less would answer worse than the search being replaced. Attachments contribute their **alt text** and **filename** as well, which is what keeps a Media Library search working, since core matches filenames through a separate filter that our rewrite leaves nothing for.
+
+Anything else goes in through one filter, with no schema change, because it all lands in the same column:
+
+```php
+add_filter( 'wpas_searchable_parts', function ( $parts, $post ) {
+    if ( 'product' === $post->post_type ) {
+        $parts[] = get_post_meta( $post->ID, 'sku', true );
+    }
+    return $parts;
+}, 10, 2 );
+```
 
 The index table is `{your_prefix}search_index`. On multisite each site gets its own, alongside its own posts table. Rename it with the `wpas_table_basename` filter if it ever collides with something else.
 

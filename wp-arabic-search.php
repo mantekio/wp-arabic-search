@@ -33,7 +33,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 // Bump this whenever the table name or shape changes, otherwise maybe_install()
 // short-circuits on an existing install and the new schema is never created.
-const SCHEMA_VERSION = '2';
+const SCHEMA_VERSION = '3';
 const SCHEMA_OPTION  = 'wpas_schema_version';
 
 /** Which mode we are running in: 'index' (default) or 'normaliser'. */
@@ -138,21 +138,36 @@ function maybe_install(): void {
 	if ( 'index' !== mode() ) {
 		return;
 	}
-	if ( get_option( SCHEMA_OPTION ) === SCHEMA_VERSION ) {
+	$installed = get_option( SCHEMA_OPTION );
+	if ( $installed === SCHEMA_VERSION ) {
 		return;
 	}
 	global $wpdb;
 	require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 	$table   = table();
 	$charset = $wpdb->get_charset_collate();
+
+	// On a schema change, drop and rebuild rather than migrate in place. The
+	// table is derived data, rebuildable from the posts in one command, and
+	// dbDelta cannot reliably drop a column or swap a FULLTEXT key anyway.
+	//
+	// The direction matters. Migrating in place would leave every existing row
+	// with an empty search_text: rows exist, so index_has_rows() sees a usable
+	// index, and every search on the site quietly returns nothing. Dropping
+	// fails the safe way instead, because an empty table makes the plugin stand
+	// aside so core answers, while status exits non-zero telling you to reindex.
+	if ( false !== $installed ) {
+		$wpdb->query( 'DROP TABLE IF EXISTS ' . $table );
+	}
+
 	dbDelta(
 		"CREATE TABLE {$table} (
 			post_id bigint(20) unsigned NOT NULL,
 			normalized_title text NOT NULL,
-			normalized_content longtext NOT NULL,
+			search_text longtext NOT NULL,
 			updated_at datetime NOT NULL,
 			PRIMARY KEY  (post_id),
-			FULLTEXT KEY search_ft (normalized_title, normalized_content)
+			FULLTEXT KEY search_ft (search_text)
 		) {$charset};"
 	);
 	update_option( SCHEMA_OPTION, SCHEMA_VERSION, false );
@@ -191,14 +206,52 @@ function index_post( $post_id ): void {
 		return;
 	}
 
-	$title   = normalize( (string) $post->post_title );
-	$content = normalize( wp_strip_all_tags( (string) $post->post_content ) );
+	// Everything searchable about this post, gathered into one field.
+	//
+	// Core searches post_title, post_excerpt AND post_content, so all three have
+	// to be in here or we answer worse than the search we replace. A post whose
+	// manual excerpt carries a word that is nowhere else would be found by plain
+	// WordPress and missed by us.
+	//
+	// Attachments keep their text in still more places: the caption is the
+	// excerpt, and the alt text and the filename are meta. Core matches the
+	// filename through a separate posts_clauses filter that rewrites its own
+	// LIKE clause, which our rewrite leaves nothing for, so the only way to keep
+	// filenames findable is to index them ourselves.
+	$parts = array(
+		$post->post_title,
+		$post->post_excerpt,
+		wp_strip_all_tags( (string) $post->post_content ),
+	);
+
+	if ( 'attachment' === $post->post_type ) {
+		$parts[] = get_post_meta( $post_id, '_wp_attachment_image_alt', true );
+		$file    = (string) get_post_meta( $post_id, '_wp_attached_file', true );
+		$parts[] = ( '' === $file ) ? '' : basename( $file );
+	}
+
+	/**
+	 * The raw strings making up a post's searchable text, before normalising.
+	 *
+	 * This is the seam for everything the plugin does not know about: a meta
+	 * field, a taxonomy, an entire custom post type's worth of them. Add to the
+	 * array and it becomes searchable, with no schema change, because it all
+	 * lands in the same indexed column.
+	 *
+	 * @param string[] $parts
+	 * @param \WP_Post $post
+	 */
+	$parts = (array) apply_filters( 'wpas_searchable_parts', $parts, $post );
+
+	$title       = normalize( (string) $post->post_title );
+	$search_text = normalize( implode( ' ', array_filter( array_map( 'strval', $parts ) ) ) );
 
 	/**
 	 * Fires whenever a post's normalised text is (re)computed.
-	 * Hook this in 'normaliser' mode to sync it to your own index.
+	 * Hook this in 'normaliser' mode to sync it to your own index. The third
+	 * argument is the whole searchable text, not just the post body.
 	 */
-	do_action( 'wpas_post_normalized', $post_id, $title, $content );
+	do_action( 'wpas_post_normalized', $post_id, $title, $search_text );
 
 	if ( 'index' !== mode() ) {
 		return;
@@ -219,7 +272,7 @@ function index_post( $post_id ): void {
 		array(
 			'post_id'            => $post_id,
 			'normalized_title'   => $title,
-			'normalized_content' => $content,
+			'search_text'        => $search_text,
 			'updated_at'         => $stamp,
 		),
 		array( '%d', '%s', '%s', '%s' )
@@ -347,7 +400,7 @@ function rewrite_search( $search, $query ) {
 	// second time for the ordering, which made MySQL walk the index twice and
 	// cost the most on exactly the searches that match a lot of rows.
 	return $wpdb->prepare(
-		' AND MATCH(wpsi.normalized_title, wpsi.normalized_content) AGAINST (%s IN BOOLEAN MODE) ',
+		' AND MATCH(wpsi.search_text) AGAINST (%s IN BOOLEAN MODE) ',
 		'+' . implode( ' +', $tokens )
 	);
 }

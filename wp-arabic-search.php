@@ -186,6 +186,15 @@ function index_post( $post_id ): void {
 		return;
 	}
 
+	// Stamp the newest modification this row reflects, not simply "now".
+	// A scheduled post carries a future post_modified_gmt, and wp_publish_post()
+	// does not rewrite it on publish, so a row stamped "now" looks permanently
+	// behind the moment that timestamp passes and status reports a correctly
+	// indexed post as stale until someone reindexes. For every ordinary save
+	// post_modified_gmt is already in the past and this is just "now".
+	$now   = current_time( 'mysql', true );
+	$stamp = ( (string) $post->post_modified_gmt > $now ) ? (string) $post->post_modified_gmt : $now;
+
 	global $wpdb;
 	$wpdb->replace(
 		table(),
@@ -193,7 +202,7 @@ function index_post( $post_id ): void {
 			'post_id'            => $post_id,
 			'normalized_title'   => $title,
 			'normalized_content' => $content,
-			'updated_at'         => current_time( 'mysql', true ),
+			'updated_at'         => $stamp,
 		),
 		array( '%d', '%s', '%s', '%s' )
 	);

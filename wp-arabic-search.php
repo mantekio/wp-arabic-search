@@ -387,21 +387,50 @@ function min_token_size(): int {
  * we should not repeat on every search.
  */
 function stopwords(): array {
-	static $words = null;
-	if ( null !== $words ) {
-		return $words;
+	return stopword_state()['words'];
+}
+
+/** Did the stopword list come from the server, or from our built-in fallback? */
+function stopwords_from_server(): bool {
+	return stopword_state()['ok'];
+}
+
+/**
+ * The stopword list, and where it came from.
+ *
+ * Reading the server's own list needs the PROCESS privilege, which plenty of
+ * managed hosts do not grant. Falling back to an empty list would silently
+ * restore the bug this exists to fix, so fall back to InnoDB's documented
+ * default instead and record that we did, so `status` and `explain` can say so.
+ *
+ * If a site has replaced the list through innodb_ft_server_stopword_table and we
+ * cannot read it, then dropping a word our list holds but theirs does not makes
+ * the search broader rather than empty, which is the safe direction to be wrong
+ * in and matches how an unusably short token is handled.
+ */
+function stopword_state(): array {
+	static $state = null;
+	if ( null !== $state ) {
+		return $state;
 	}
 
 	$cached = get_transient( 'wpas_stopwords' );
-	if ( is_array( $cached ) ) {
-		$words = $cached;
-		return $words;
+	if ( is_array( $cached ) && isset( $cached['ok'], $cached['words'] ) ) {
+		$state = $cached;
+		return $state;
 	}
 
 	global $wpdb;
 	$suppress = $wpdb->suppress_errors( true );
 	$rows     = $wpdb->get_col( 'SELECT value FROM INFORMATION_SCHEMA.INNODB_FT_DEFAULT_STOPWORD' );
 	$wpdb->suppress_errors( $suppress );
+
+	$ok = ! empty( $rows );
+	if ( ! $ok ) {
+		// InnoDB's documented default list. 36 entries as published, one of which
+		// ("the") appears twice, so 35 survive being keyed.
+		$rows = explode( ' ', 'a about an are as at be by com de en for from how i in is it la of on or that the this to was what when where who will with und the www' );
+	}
 
 	$words = array();
 	foreach ( (array) $rows as $w ) {
@@ -411,8 +440,12 @@ function stopwords(): array {
 		}
 	}
 
-	set_transient( 'wpas_stopwords', $words, WEEK_IN_SECONDS );
-	return $words;
+	$state = array(
+		'ok'    => $ok,
+		'words' => $words,
+	);
+	set_transient( 'wpas_stopwords', $state, WEEK_IN_SECONDS );
+	return $state;
 }
 
 /**
@@ -624,6 +657,9 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			\WP_CLI::log( 'mode:        ' . mode() );
 			\WP_CLI::log( 'raw:         ' . $raw );
 			\WP_CLI::log( 'normalised:  ' . $normalised );
+			if ( ! stopwords_from_server() ) {
+				\WP_CLI::warning( 'could not read the server stopword list (needs the PROCESS privilege); using InnoDB\'s documented default, so a custom server list is not reflected below.' );
+			}
 
 			if ( 'index' !== mode() ) {
 				\WP_CLI::warning( 'normaliser mode: this plugin does not answer searches, so WordPress runs its own.' );
@@ -677,6 +713,10 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				)
 			);
 			\WP_CLI::log( 'index hits:   ' . $hits );
+			\WP_CLI::log( '' );
+			\WP_CLI::log( 'Index hits counts rows in the index, which is not the number of' );
+			\WP_CLI::log( 'results: WordPress still applies post type, status and capability' );
+			\WP_CLI::log( 'rules on top, so the final count is usually lower.' );
 			\WP_CLI::success( 'explained' );
 		},
 		array( 'shortdesc' => 'Show how a search term is folded, which tokens are used, and what it matches.' )
@@ -819,6 +859,26 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			}
 			$rows  = (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . $table );
 			$posts = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE " . indexable_where() );
+
+			// Count the two conditions directly rather than inferring them from the
+			// totals. Comparing counts looked reasonable and was wrong: orphaned rows
+			// inflate the row count, so an index missing 15 posts and carrying 15
+			// orphans has totals that match exactly, and the old test reported
+			// "index is current" while those 15 posts were unsearchable. One fault
+			// concealing another is precisely the failure this command exists to
+			// prevent, so ask each question on its own.
+			$missing = (int) $wpdb->get_var(
+				"SELECT COUNT(*) FROM {$wpdb->posts} p
+				 LEFT JOIN {$table} i ON i.post_id = p.ID
+				 WHERE " . indexable_where( 'p' ) . "
+				   AND i.post_id IS NULL"
+			);
+			$orphans = (int) $wpdb->get_var(
+				"SELECT COUNT(*) FROM {$table} i
+				 LEFT JOIN {$wpdb->posts} p
+				        ON p.ID = i.post_id AND " . indexable_where( 'p' ) . "
+				 WHERE p.ID IS NULL"
+			);
 			// A row that exists but is out of date. Counting rows cannot see this:
 			// an importer, a migration or a direct SQL write changes the post
 			// without firing save_post, so the index keeps a stale copy and the
@@ -837,14 +897,26 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				   AND p.post_modified_gmt <= UTC_TIMESTAMP()
 				   AND i.updated_at < p.post_modified_gmt"
 			);
-			\WP_CLI::log( 'table:  ' . $table );
-			\WP_CLI::log( "rows:   {$rows} indexed / {$posts} posts" );
-			\WP_CLI::log( "stale:  {$stale}" );
-			if ( $rows < $posts ) {
-				\WP_CLI::error( sprintf( 'index is behind by %d posts; run: wp arabic-search reindex', $posts - $rows ) );
+			\WP_CLI::log( 'table:   ' . $table );
+			\WP_CLI::log( "rows:    {$rows} indexed / {$posts} posts" );
+			\WP_CLI::log( "missing: {$missing}" );
+			\WP_CLI::log( "stale:   {$stale}" );
+			\WP_CLI::log( "orphans: {$orphans}" );
+			if ( ! stopwords_from_server() ) {
+				\WP_CLI::warning( 'could not read the server stopword list (needs the PROCESS privilege); using InnoDB\'s documented default.' );
+			}
+			if ( $missing > 0 ) {
+				\WP_CLI::error( sprintf( '%d posts are not indexed; run: wp arabic-search reindex', $missing ) );
 			}
 			if ( $stale > 0 ) {
 				\WP_CLI::error( sprintf( '%d indexed posts are stale; run: wp arabic-search reindex', $stale ) );
+			}
+			// Orphans do not make search wrong, since the join simply never matches
+			// them, so this reports without failing. But it must report: the drift
+			// that --prune exists to clear was the one thing this command stayed
+			// silent about.
+			if ( $orphans > 0 ) {
+				\WP_CLI::warning( sprintf( '%d orphaned rows; run: wp arabic-search reindex --prune', $orphans ) );
 			}
 			\WP_CLI::success( 'index is current' );
 		},
